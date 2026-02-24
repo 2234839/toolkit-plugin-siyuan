@@ -1,7 +1,7 @@
 import { siyuan } from '@llej/js_util';
-import { Dialog, Menu } from 'siyuan';
+import { Dialog, Menu, showMessage } from 'siyuan';
 import { ref } from 'vue';
-import { getBlockKramdown, pushErrMsg, pushMsg, updateBlock, upload } from '~/libs/api';
+import { getBlockKramdown, updateBlock, upload } from '~/libs/api';
 import { ialToJson } from '~/libs/siyuan_util';
 import { SiyuanPlugin } from '~/libs/siyuanPlugin';
 import Setting_view from './setting_view.vue';
@@ -187,96 +187,45 @@ export default class ToolKitPlugin extends SiyuanPlugin {
               // 检查是否为图片文件
               const imageExtensions = ['.png', '.jpg', '.jpeg', '.bmp', '.svg'];
               const isImage = imageExtensions.some((ext) => value.name.toLowerCase().endsWith(ext));
-              const isWebp =
-                value.name.toLowerCase().endsWith('.webp') || value.type.includes('webp');
 
               // 检查是否为视频文件，排除视频格式
               const isVideo = this.isVideoFile(value.name);
 
               if (isImage && !isVideo) {
-                // 检查是否跳过 WebP
-                if (this.toolkit_setting.value().image_skip_webp && isWebp) {
-                  newFormData.append(key, value);
-                  continue;
-                }
-
-                // 检查是否跳过小文件
-                if (
-                  this.toolkit_setting.value().image_skip_small &&
-                  value.size < this.toolkit_setting.value().image_min_size
-                ) {
+                // 检查是否应该跳过压缩
+                const skipCheck = this.shouldSkipCompression(value);
+                if (skipCheck.skip) {
+                  if (skipCheck.reason === 'Excalidraw 插件资源') {
+                    showMessage(`跳过 Excalidraw 插件资源: ${value.name}`);
+                  }
                   newFormData.append(key, value);
                   continue;
                 }
 
                 // 创建压缩 Promise
-                const enableSmartCompression = this.toolkit_setting.value().enable_smart_compression;
-                const targetSimilarity = this.toolkit_setting.value().target_similarity;
-
-                // 智能压缩需要原始图片的预览 URL
                 const originalPreview = URL.createObjectURL(value);
-
-                const compressionPromise = enableSmartCompression ?
-                  // 使用智能压缩
-                  this.smartCompressImage(value, originalPreview, targetSimilarity, 10)
-                    .then((result) => {
-                      // 智能压缩会自动释放 originalPreview URL
-                      const compressedFile = result.file;
-                      newFormData.append(key, compressedFile);
+                const compressionPromise = this.compressImageWithSettings(value, originalPreview)
+                  .then((result) => {
+                    if (result) {
+                      newFormData.append(key, result.file);
                       hasCompressed = true;
-                      const compressionRatio = ((value.size - compressedFile.size) / value.size * 100).toFixed(1);
-                      const totalRounds = result.roundTimes.length;
-                      console.log(`[智能压缩] 已压缩图片 (XHR): ${value.name} | ${(value.size / 1024).toFixed(1)}KB -> ${(compressedFile.size / 1024).toFixed(1)}KB (-${compressionRatio}%) | 相似度 ${result.similarity.toFixed(2)}% | 轮数 ${totalRounds}`);
-                    })
-                    .catch((error) => {
-                      // 智能压缩失败，释放 URL
-                      URL.revokeObjectURL(originalPreview);
-                      console.error(`[智能压缩] 失败 (XHR) ${value.name}:`, error);
-                      // 回退到普通压缩
-                      return this.compressImageToWebP(value, this.toolkit_setting.value().image_compression_quality)
-                        .then((compressedBlob) => {
-                          if (compressedBlob) {
-                            const compressedFile = new File(
-                              [compressedBlob],
-                              value.name.replace(/\.[^/.]+$/, '.webp'),
-                              { type: 'image/webp' },
-                            );
-                            newFormData.append(key, compressedFile);
-                            hasCompressed = true;
-                            const compressionRatio = ((value.size - compressedFile.size) / value.size * 100).toFixed(1);
-                            console.log(`[回退普通压缩] 已压缩图片 (XHR): ${value.name} -> ${compressedFile.name} | ${(value.size / 1024).toFixed(1)}KB -> ${(compressedFile.size / 1024).toFixed(1)}KB (-${compressionRatio}%)`);
-                          } else {
-                            newFormData.append(key, value);
-                          }
-                        });
-                    })
-                  :
-                  // 使用普通压缩
-                  this.compressImageToWebP(value, this.toolkit_setting.value().image_compression_quality)
-                    .then((compressedBlob) => {
-                      // 普通压缩完成，释放 URL
-                      URL.revokeObjectURL(originalPreview);
-                      if (compressedBlob) {
-                        const compressedFile = new File(
-                          [compressedBlob],
-                          value.name.replace(/\.[^/.]+$/, '.webp'),
-                          { type: 'image/webp' },
-                        );
-                        newFormData.append(key, compressedFile);
-                        hasCompressed = true;
-                        const compressionRatio = ((value.size - compressedFile.size) / value.size * 100).toFixed(1);
-                        console.log(`已压缩图片 (XHR): ${value.name} -> ${compressedFile.name} | ${(value.size / 1024).toFixed(1)}KB -> ${(compressedFile.size / 1024).toFixed(1)}KB (-${compressionRatio}%)`);
-                      } else {
-                        // 压缩失败，使用原文件
-                        newFormData.append(key, value);
-                      }
-                    })
-                    .catch((error) => {
-                      URL.revokeObjectURL(originalPreview);
-                      console.error(`压缩图片失败 (XHR) ${value.name}:`, error);
-                      // 压缩失败，使用原文件
+                    } else {
+                      // 压缩被跳过或失败，使用原文件
                       newFormData.append(key, value);
-                    });
+                    }
+                  })
+                  .catch((error) => {
+                    URL.revokeObjectURL(originalPreview);
+                    console.error(`压缩图片失败 (XHR) ${value.name}:`, error);
+                    // 压缩失败，使用原文件
+                    newFormData.append(key, value);
+                  })
+                  .finally(() => {
+                    // 确保释放 URL（智能压缩会自己释放，但这里作为保险）
+                    if (!this.toolkit_setting.value().enable_smart_compression) {
+                      URL.revokeObjectURL(originalPreview);
+                    }
+                  });
 
                 compressionPromises.push(compressionPromise);
               } else {
@@ -420,25 +369,25 @@ export default class ToolKitPlugin extends SiyuanPlugin {
     try {
       const activeElement = document.querySelector('.protyle:not(.fn__none) .protyle-content');
       if (!activeElement) {
-        pushErrMsg('请先打开一个笔记');
+        showMessage('请先打开一个笔记');
         return;
       }
 
       const documentElement = activeElement.querySelector('.protyle-title[data-node-id]');
       if (!documentElement) {
-        pushErrMsg('无法获取当前笔记ID');
+        showMessage('无法获取当前笔记ID');
         return;
       }
 
       const blockId = documentElement.getAttribute('data-node-id');
       if (!blockId) {
-        pushErrMsg('无法获取当前笔记ID');
+        showMessage('无法获取当前笔记ID');
         return;
       }
 
       const kramdownRes = await getBlockKramdown(blockId);
       if (!kramdownRes || !kramdownRes.kramdown) {
-        pushErrMsg('无法获取笔记内容');
+        showMessage('无法获取笔记内容');
         return;
       }
 
@@ -502,10 +451,24 @@ export default class ToolKitPlugin extends SiyuanPlugin {
                 }
                 // 获取图片数据
                 const imageData = await response.arrayBuffer();
+                const file = new File([imageData], imgUrl.split('/').pop() || 'image.png', { type: 'image/png' });
 
-                const compressedImage = await this.compressImageToWebP(imageData, 0.8, imgUrl);
-                if (compressedImage) {
-                  const res = await upload(undefined, [compressedImage]);
+                // 检查是否应该跳过压缩
+                const skipCheck = this.shouldSkipCompression(file, imgUrl);
+                if (skipCheck.skip) {
+                  skippedCount++;
+                  if (skipCheck.reason === 'Excalidraw 插件资源') {
+                    console.log(`跳过 Excalidraw 插件资源: ${imgUrl}`);
+                  }
+                  continue;
+                }
+
+                // 创建预览 URL 用于智能压缩
+                const originalPreview = URL.createObjectURL(file);
+                const compressResult = await this.compressImageWithSettings(file, originalPreview);
+
+                if (compressResult) {
+                  const res = await upload(undefined, [compressResult.file]);
                   const webpPath = Object.values(res.succMap)[0];
                   const oldImageMarkdown = `![${match[1]}](${match[2]})`;
 
@@ -545,28 +508,123 @@ export default class ToolKitPlugin extends SiyuanPlugin {
         if (skippedCount > 0) {
           message += `，跳过 ${skippedCount} 个图片（可能是 WebP 格式或压缩失败）`;
         }
-        pushMsg(message);
+        showMessage(message);
       } else {
         if (skippedCount > 0) {
-          pushMsg(
+          showMessage(
             `没有成功压缩任何图片，跳过 ${skippedCount} 个图片（可能是 WebP 格式或压缩失败）`,
           );
         } else {
-          pushMsg('当前笔记中没有找到可压缩的图片');
+          showMessage('当前笔记中没有找到可压缩的图片');
         }
       }
     } catch (error) {
       console.error('压缩图片时出错:', error);
-      pushErrMsg('压缩图片时出错，请查看控制台');
+      showMessage('压缩图片时出错，请查看控制台', 3000, 'error');
     }
   }
 
-  // 视频文件扩展名列表
+  /** 视频文件扩展名列表 */
   private videoExtensions = ['.mp4', '.avi', '.mov', '.wmv', '.flv', '.webm', '.mkv', '.m4v', '.3gp', '.ogv'];
 
-  // 检查是否为视频文件
+  /**
+   * 检查是否为视频文件
+   * @param fileName 文件名
+   * @returns 是否为视频文件
+   */
   private isVideoFile(fileName: string): boolean {
     return this.videoExtensions.some(ext => fileName.toLowerCase().includes(ext));
+  }
+
+  /**
+   * 检查是否应该跳过此图片的压缩
+   * @param file 图片文件
+   * @param imgUrl 图片 URL（可选，用于检查扩展名）
+   * @returns 是否应该跳过压缩
+   */
+  private shouldSkipCompression(file: File, imgUrl?: string): { skip: boolean; reason?: string } {
+    const settings = this.toolkit_setting.value();
+
+    // 检查是否为 Excalidraw 插件资源
+    const fileName = file.name.toLowerCase();
+    const urlPath = imgUrl?.toLowerCase() || '';
+    const isExcalidraw = fileName.startsWith('excalidraw-') || urlPath.includes('excalidraw-');
+
+    if (isExcalidraw) {
+      return { skip: true, reason: 'Excalidraw 插件资源' };
+    }
+
+    // 检查是否为 WebP 图片
+    const isWebp =
+      file.name.toLowerCase().endsWith('.webp') ||
+      file.type.includes('webp') ||
+      (imgUrl && imgUrl.toLowerCase().includes('.webp'));
+
+    if (settings.image_skip_webp && isWebp) {
+      return { skip: true, reason: 'WebP 格式' };
+    }
+
+    // 检查文件大小
+    if (settings.image_skip_small && file.size < settings.image_min_size) {
+      return { skip: true, reason: '文件太小' };
+    }
+
+    return { skip: false };
+  }
+
+  /**
+   * 统一的图片压缩方法
+   * 根据配置决定使用普通压缩或智能压缩
+   *
+   * @param file 图片文件
+   * @param originalPreview 原始图片预览 URL（智能压缩需要）
+   * @returns 压缩后的图片文件
+   */
+  private async compressImageWithSettings(
+    file: File,
+    originalPreview?: string
+  ): Promise<{ file: File; similarity?: number; roundTimes?: number[] } | null> {
+    const settings = this.toolkit_setting.value();
+
+    // 检查是否应该跳过
+    const skipCheck = this.shouldSkipCompression(file);
+    if (skipCheck.skip) {
+      if (skipCheck.reason === 'Excalidraw 插件资源') {
+        console.log(`跳过 ${skipCheck.reason}: ${file.name}`);
+      }
+      return null;
+    }
+
+    try {
+      // 检查是否启用智能压缩
+      if (settings.enable_smart_compression && originalPreview) {
+        // 使用智能压缩
+        const result = await this.smartCompressImage(
+          file,
+          originalPreview,
+          settings.target_similarity,
+          10
+        );
+        console.log(`[智能压缩] 已压缩图片: ${file.name} | ${(file.size / 1024).toFixed(1)}KB -> ${(result.file.size / 1024).toFixed(1)}KB (-${((file.size - result.file.size) / file.size * 100).toFixed(1)}%) | 相似度 ${result.similarity.toFixed(2)}% | 轮数 ${result.roundTimes.length}`);
+        return {
+          file: result.file,
+          similarity: result.similarity,
+          roundTimes: result.roundTimes,
+        };
+      } else {
+        // 使用普通压缩
+        const compressedFile = await this.compressImageToWebP(file, settings.image_compression_quality, file.name);
+        if (compressedFile) {
+          const compressionRatio = ((file.size - compressedFile.size) / file.size * 100).toFixed(1);
+          console.log(`[普通压缩] 已压缩图片: ${file.name} | ${(file.size / 1024).toFixed(1)}KB -> ${(compressedFile.size / 1024).toFixed(1)}KB (-${compressionRatio}%)`);
+          return { file: compressedFile };
+        }
+        return null;
+      }
+    } catch (error) {
+      console.error(`压缩图片失败 ${file.name}:`, error);
+      return null;
+    }
   }
 
   setupImageMenu() {
@@ -579,30 +637,26 @@ export default class ToolKitPlugin extends SiyuanPlugin {
           const spanImg = event.detail.element as HTMLElement;
           const img = spanImg.querySelector(`img[data-src]`) as HTMLImageElement;
           const imgSrc = img.dataset.src!;
-          const ok = await this.compressSingleImage(imgSrc);
-          if (ok) {
-            pushMsg('图片压缩成功');
+          const result = await this.compressSingleImage(imgSrc);
+          if (result === true) {
+            showMessage('图片压缩成功');
             // 移除UI组件，定时循环就会自动添加一个新的，能够重新加载一遍 json 数据
             spanImg.querySelector('.img__compress')?.remove();
+          } else if (result === 'skipped') {
+            // 已显示跳过原因，不需要额外提示
           } else {
-            pushErrMsg('图片压缩失败');
+            showMessage('图片压缩失败', 3000, 'error');
           }
         },
       });
     });
   }
 
-  async compressSingleImage(imgSrc: string): Promise<boolean> {
+  async compressSingleImage(imgSrc: string): Promise<boolean | 'skipped'> {
     try {
-      // 检查是否已经是 WebP 格式
-      if (imgSrc.toLowerCase().includes('.webp')) {
-        pushErrMsg('图片已经是 WebP 格式，无需压缩');
-        return false;
-      }
-
       // 检查是否为视频文件，排除视频格式
       if (this.isVideoFile(imgSrc)) {
-        pushErrMsg('视频文件不支持压缩');
+        showMessage('视频文件不支持压缩', 3000, 'error');
         return false;
       }
 
@@ -614,13 +668,23 @@ export default class ToolKitPlugin extends SiyuanPlugin {
 
       // 获取图片数据
       const imageData = await response.arrayBuffer();
+      const file = new File([imageData], imgSrc.split('/').pop() || 'image.png', { type: 'image/png' });
 
-      // 压缩图片
-      const compressedImage = await this.compressImageToWebP(imageData, this.toolkit_setting.value().image_compression_quality, imgSrc);
+      // 检查是否应该跳过压缩
+      const skipCheck = this.shouldSkipCompression(file, imgSrc);
+      if (skipCheck.skip) {
+        const message = `跳过压缩: ${skipCheck.reason || '未知原因'}`;
+        showMessage(message);
+        return 'skipped';
+      }
 
-      if (compressedImage) {
+      // 创建预览 URL 用于智能压缩
+      const originalPreview = URL.createObjectURL(file);
+      const compressResult = await this.compressImageWithSettings(file, originalPreview);
+
+      if (compressResult) {
         // 上传压缩后的图片
-        const uploadRes = await upload(undefined, [compressedImage]);
+        const uploadRes = await upload(undefined, [compressResult.file]);
         const webpPath = Object.values(uploadRes.succMap)[0];
 
         if (webpPath) {
